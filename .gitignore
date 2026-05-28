@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+
+artifacts/*.db
+artifacts/*.db-*
+artifacts/*.jsonl

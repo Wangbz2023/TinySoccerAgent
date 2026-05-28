@@ -324,7 +324,7 @@ def execute_tool_chain(input_text, toolbox_functions, Instruction="You are a hel
 
 toolbox_descriptions = load_toolbox_str()
 tasks = csv_to_task_string()
-
+#定义“第一阶段 Planner Prompt”。这个字符串不是普通说明文，而是喂给 LLM 的系统级任务说明，用来让 LLM 把用户问题拆成工具链。
 TaskDecompositionPrompt = f"""
 # Soccer Question Answering Assistant
 
