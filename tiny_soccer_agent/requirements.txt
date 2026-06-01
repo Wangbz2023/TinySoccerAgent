@@ -1,0 +1,10 @@
+# TinySoccerAgent 轻量运行依赖
+#
+# 推荐 Python 版本：3.11
+# 可接受版本：3.10 - 3.12
+#
+# 本项目主体只使用 Python 标准库：
+# argparse / csv / dataclasses / json / pathlib / sqlite3 / tarfile / typing 等。
+# 下面这个依赖只用于调用 DeepSeek 的 OpenAI-compatible API。
+
+openai>=1.77.0,<2.0.0

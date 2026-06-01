@@ -104,20 +104,40 @@ def cmd_eval(args: argparse.Namespace) -> None:
         memory.close()
 
     total = len(outputs)
-    verified = sum(1 for item in outputs if item["verification"].get("factual"))
-    evidence_covered = sum(1 for item in outputs if item["verification"].get("evidence_count", 0) > 0)
+    verified = sum(1 for item in outputs if item["evaluation"].get("factual"))
+    evidence_covered = sum(1 for item in outputs if item["evaluation"].get("evidence_coverage"))
     trace_steps = [step for item in outputs for step in item["trace"]]
-    ok_steps = sum(1 for step in trace_steps if step["status"] == "ok")
+    ok_steps = sum(1 for step in trace_steps if step["status"] in {"ok", "fallback"})
+    fallback_steps = sum(1 for step in trace_steps if step["status"] == "fallback")
     elapsed = [step["elapsed_ms"] for step in trace_steps]
+    baseline_outputs = [_baseline_commentary(event) for event in events]
+    baseline_coverage = sum(1 for text in baseline_outputs if text)
+    with_game_info = sum(1 for item in outputs if item["evidence"].get("match_info"))
+    with_history = sum(1 for item in outputs if item["evidence"].get("timeline_events"))
 
     _print_json(
         {
             "status": "ok",
             "events": total,
-            "factual_pass_rate": round(verified / total, 4) if total else 0,
-            "evidence_coverage": round(evidence_covered / total, 4) if total else 0,
-            "tool_success_rate": round(ok_steps / len(trace_steps), 4) if trace_steps else 0,
-            "avg_step_latency_ms": round(sum(elapsed) / len(elapsed), 3) if elapsed else 0,
+            "baseline_template": {
+                "coverage": round(baseline_coverage / total, 4) if total else 0,
+                "uses_tool_chain": False,
+            },
+            "planner_executor_with_game_info": {
+                "coverage": round(with_game_info / total, 4) if total else 0,
+                "tool_chain": ["Game Search", "Game Info Retrieval"],
+            },
+            "planner_executor_with_game_info_and_history": {
+                "coverage": round(with_history / total, 4) if total else 0,
+                "tool_chain": ["Game Search", "Game Info Retrieval", "Match History Retrieval"],
+            },
+            "planner_executor_full": {
+                "factual_pass_rate": round(verified / total, 4) if total else 0,
+                "evidence_coverage": round(evidence_covered / total, 4) if total else 0,
+                "tool_success_rate": round(ok_steps / len(trace_steps), 4) if trace_steps else 0,
+                "fallback_steps": fallback_steps,
+                "avg_step_latency_ms": round(sum(elapsed) / len(elapsed), 3) if elapsed else 0,
+            },
         }
     )
 
@@ -135,7 +155,7 @@ def cmd_export_training_data(args: argparse.Namespace) -> None:
         with output_path.open("w", encoding="utf-8") as handle:
             for event in events:
                 output = harness.run_event(event)
-                if output["verification"].get("risk") == "high":
+                if output["evaluation"].get("risk") == "high":
                     continue
                 record = _training_record(event, output)
                 handle.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -169,7 +189,9 @@ def _training_record(event: EventPacket, output: Dict[str, Any]) -> Dict[str, An
                 "content": json.dumps(
                     {
                         "commentary": output["commentary"],
-                        "verification": output["verification"],
+                        "known_info": output["known_info"],
+                        "tool_chain": output["tool_chain"],
+                        "evaluation": output["evaluation"],
                         "trace": [
                             {
                                 "agent": step["agent"],
@@ -195,6 +217,12 @@ def _configure_stdout() -> None:
     # Windows 终端默认编码可能不是 UTF-8，这里强制 stdout 使用 UTF-8，避免中文输出乱码。
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
+
+
+def _baseline_commentary(event: EventPacket) -> str:
+    # eval 里的最小 baseline：不使用 Game Search / Retrieval，只复述当前事件描述。
+    minute = f"{event.minute}，" if event.minute else ""
+    return f"{minute}{event.raw_description}" if event.raw_description else ""
 
 
 if __name__ == "__main__":

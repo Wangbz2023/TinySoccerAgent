@@ -1,226 +1,226 @@
-"""智能体编排层：规划、检索、生成、校验并记录 trace。"""
+"""2-agent 编排层：PlannerAgent 规划工具链，ExecutionAgent 执行工具链。
+
+本文件只保留 agent/harness：
+- PlannerAgent：输出 Known Info 和 Tool Chain。
+- ExecutionAgent：按工具链调用 ToolRegistry。
+- CommentaryHarness：对 CLI 暴露稳定入口。
+
+具体工具实现放在 tiny_soccer_agent/tools/，事实评估放在 evaluation.py。
+"""
 
 from __future__ import annotations
 
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List
 
+from .evaluation import EvaluationInterface
 from .memory import SQLiteMemory
 from .schemas import EventPacket
+from .tools import (
+    TOOL_COMMENTARY,
+    TOOL_GAME_INFO,
+    TOOL_GAME_SEARCH,
+    TOOL_LLM,
+    TOOL_MATCH_HISTORY,
+    TOOL_TEXTUAL_RAG,
+    ToolCall,
+    ToolRegistry,
+    build_default_registry,
+)
+from .tools.base import evidence_from_context, source_path_from_ref
 
 
 @dataclass
-class EvidenceBundle:
-    """Retriever 返回的证据包，统一喂给解说生成和校验环节。"""
+class ToolChainPlan:
+    """PlannerAgent 的输出：已知信息、任务类型和工具链。"""
 
-    match_info: Optional[Dict[str, Any]]
-    timeline_events: List[Dict[str, Any]]
-    similar_events: List[Dict[str, Any]]
+    known_info: List[str]
+    task_type: str
+    tool_chain: List[str]
+    reason: str
 
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "match_info": self.match_info,
-            "timeline_events": self.timeline_events,
-            "similar_events": self.similar_events,
+            "known_info": self.known_info,
+            "task_type": self.task_type,
+            "tool_chain": self.tool_chain,
+            "reason": self.reason,
         }
 
-
-class Planner:
-    def plan(self, event: EventPacket) -> Dict[str, Any]:
-        """根据事件类型给出轻量工具链计划。"""
-        tools = ["match_info_retrieval", "timeline_retrieval"]
-        if event.event_type in {"goal", "own_goal"}:
-            tools.append("score_context")
-        if event.event_type in {"yellow_card", "red_card", "second_yellow_red_card", "foul"}:
-            tools.append("discipline_context")
-        if event.event_type in {"corner", "substitution"}:
-            tools.append("phase_context")
-        tools.extend(["commentary_writer", "verifier"])
-        return {
-            "event_type": event.event_type,
-            "tools": tools,
-            "needs_rag": True,
-            "needs_verification": True,
-        }
+    def to_prompt_text(self) -> str:
+        known = ", ".join(f"${item}$" for item in self.known_info)
+        chain = " -> ".join(f"*{tool}*" for tool in self.tool_chain)
+        return f"Known Info: [{known}]\nTool Chain: [{chain}]"
 
 
-class Retriever:
-    def __init__(self, memory: SQLiteMemory):
+class PlannerAgent:
+    """规划 agent：只负责输出 Known Info 和 Tool Chain，不直接查库或写解说。"""
+
+    def plan(self, event: EventPacket) -> ToolChainPlan:
+        known_info = ["EventPacket"]
+        if event.match_id:
+            known_info.append("GameContext")
+        if event.source_refs:
+            known_info.append("SourceRef")
+
+        tool_chain = [
+            TOOL_GAME_SEARCH,
+            TOOL_GAME_INFO,
+            TOOL_MATCH_HISTORY,
+        ]
+        if event.players or event.team:
+            tool_chain.append(TOOL_TEXTUAL_RAG)
+        tool_chain.extend([TOOL_COMMENTARY, TOOL_LLM])
+
+        return ToolChainPlan(
+            known_info=known_info,
+            task_type="event_commentary_generation",
+            tool_chain=tool_chain,
+            reason="事件解说任务需要先定位比赛 JSON，再读取比赛信息和同场历史事件，最后生成并综合解说。",
+        )
+
+
+class ExecutionAgent:
+    """执行 agent：按照 PlannerAgent 的 tool_chain 顺序调用工具并记录 trace。"""
+
+    def __init__(self, registry: ToolRegistry, memory: SQLiteMemory):
+        self.registry = registry
         self.memory = memory
 
-    def retrieve(self, event: EventPacket) -> EvidenceBundle:
-        """从比赛信息、当前时间线和同类事件中取证据。"""
-        match = self.memory.get_match(event.match_id)
-        event_index = event.metadata.get("event_index")
-        timeline = self.memory.match_events(
-            event.match_id,
-            limit=8,
-            until_index=event_index if isinstance(event_index, int) else None,
-        )
-        similar = self.memory.events_by_type(event.event_type, limit=5)
-        return EvidenceBundle(
-            match_info=match.to_dict() if match else None,
-            timeline_events=[_compact_event(item) for item in timeline],
-            similar_events=[_compact_event(item) for item in similar],
-        )
-
-
-class CommentaryWriter:
-    def write(self, event: EventPacket, evidence: EvidenceBundle) -> str:
-        """先用模板保证闭环稳定，后续可替换为 LLM writer。"""
-        minute = f"{event.minute}，" if event.minute else ""
-        team = event.team or _team_from_match(evidence.match_info) or "场上球队"
-        players = "、".join(event.players[:3])
-        player_phrase = f"{players}参与其中，" if players else ""
-        score_phrase = f"当前比分信息为 {event.score}。" if event.score else ""
-        description = _shorten(event.raw_description)
-
-        if event.event_type in {"goal", "own_goal"}:
-            return f"{minute}{team}完成关键进球，{player_phrase}{score_phrase}这次进攻可以这样解说：{description}"
-        if event.event_type in {"yellow_card", "red_card", "second_yellow_red_card"}:
-            return f"{minute}裁判对这次犯规作出处罚，{player_phrase}{team}需要控制比赛情绪。事件描述：{description}"
-        if event.event_type == "corner":
-            return f"{minute}{team}获得角球机会，{player_phrase}这是一次可以制造威胁的定位球。事件描述：{description}"
-        if event.event_type == "substitution":
-            return f"{minute}{team}进行人员调整，{player_phrase}这可能改变接下来的比赛节奏。事件描述：{description}"
-        if event.event_type in {"foul", "penalty", "free_kick"}:
-            return f"{minute}比赛出现判罚节点，{player_phrase}{team}获得或送出一次关键球权变化。事件描述：{description}"
-        return f"{minute}{team}出现新的比赛事件，{player_phrase}{score_phrase}事件描述：{description}"
-
-
-class Verifier:
-    def verify(self, event: EventPacket, commentary: str, evidence: EvidenceBundle) -> Dict[str, Any]:
-        """做第一版规则校验，重点拦截缺证据、未知事件和明显遗漏。"""
-        issues: List[str] = []
-        if not event.raw_description:
-            issues.append("missing_raw_description")
-        if event.event_type == "unknown":
-            issues.append("unknown_event_type")
-        if not evidence.match_info:
-            issues.append("missing_match_info")
-        if not evidence.timeline_events:
-            issues.append("missing_timeline_evidence")
-        if event.team and event.team not in commentary:
-            issues.append("team_not_mentioned")
-
-        risk = "low"
-        if "missing_match_info" in issues or "unknown_event_type" in issues:
-            risk = "medium"
-        if len(issues) >= 3:
-            risk = "high"
-
-        return {
-            "factual": risk != "high",
-            "risk": risk,
-            "issues": issues,
-            "evidence_count": len(evidence.timeline_events) + len(evidence.similar_events),
+    def execute(self, event: EventPacket, plan: ToolChainPlan, run_id: str) -> Dict[str, Any]:
+        context: Dict[str, Any] = {
+            "event": event,
+            "json_path": source_path_from_ref(event.primary_source_ref),
+            "step_results": [],
         }
+        step_results: List[Dict[str, Any]] = []
+        trace: List[Dict[str, Any]] = []
+
+        for step_index, tool_name in enumerate(plan.tool_chain):
+            call = self._build_call(tool_name, event, context)
+            start = time.perf_counter()
+            result = self.registry.execute(call, context)
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            result_dict = result.to_dict()
+            call_dict = call.to_dict()
+            step_record = {
+                "step_index": step_index,
+                "call": call_dict,
+                "result": result_dict,
+                "elapsed_ms": round(elapsed_ms, 3),
+                "status": result.status,
+            }
+            step_results.append(step_record)
+            context["step_results"] = step_results
+
+            trace_record = {
+                "run_id": run_id,
+                "step_index": step_index + 1,
+                "agent": "ExecutionAgent",
+                "tool": tool_name,
+                "purpose": call.purpose,
+                "query": call.query,
+                "material": call.material,
+                "answer": result.answer,
+                "status": result.status,
+                "elapsed_ms": round(elapsed_ms, 3),
+            }
+            trace.append(trace_record)
+            self.memory.record_trace(
+                run_id=run_id,
+                step_index=step_index + 1,
+                agent="ExecutionAgent",
+                tool=tool_name,
+                status=result.status,
+                elapsed_ms=elapsed_ms,
+                input_data=call_dict,
+                output_data=result_dict,
+            )
+
+        evaluation = EvaluationInterface().evaluate(
+            event=event,
+            final_commentary=str(context.get("final_commentary") or context.get("commentary_candidate") or ""),
+            context=context,
+            step_results=step_results,
+        )
+        return {
+            "commentary": str(context.get("final_commentary") or context.get("commentary_candidate") or ""),
+            "evidence": evidence_from_context(context),
+            "step_results": step_results,
+            "trace": trace,
+            "evaluation": evaluation,
+        }
+
+    def _build_call(self, tool_name: str, event: EventPacket, context: Dict[str, Any]) -> ToolCall:
+        json_path = str(context.get("json_path") or source_path_from_ref(event.primary_source_ref))
+        material = [json_path] if json_path else []
+        query_prefix = f"event_type={event.event_type}; minute={event.minute}; match_id={event.match_id}"
+        purposes = {
+            TOOL_GAME_SEARCH: "定位当前事件所属的比赛 JSON 文件路径。",
+            TOOL_GAME_INFO: "读取当前比赛的主客队、比分、场馆、裁判等比赛级信息。",
+            TOOL_MATCH_HISTORY: "读取同一场比赛中当前事件及其之前最近的历史事件。",
+            TOOL_TEXTUAL_RAG: "检索同类型事件或实体相关文本，补充解说上下文。",
+            TOOL_COMMENTARY: "根据事件、比赛信息和历史事件生成解说候选。",
+            TOOL_LLM: "对工具结果进行最终综合，输出面向用户的解说。",
+        }
+        return ToolCall(
+            purpose=purposes.get(tool_name, "执行工具链中的下一步。"),
+            tool=tool_name,
+            query=f"{query_prefix}; {event.raw_description}",
+            material=[] if tool_name == TOOL_GAME_SEARCH else material,
+        )
 
 
 class CommentaryHarness:
-    """串联 Planner/Retriever/Writer/Verifier，并把每一步写入 TraceMemory。"""
+    """对外兼容的 harness：串联 PlannerAgent 和 ExecutionAgent。"""
 
     def __init__(self, memory: SQLiteMemory):
         self.memory = memory
-        self.planner = Planner()
-        self.retriever = Retriever(memory)
-        self.writer = CommentaryWriter()
-        self.verifier = Verifier()
+        self.planner = PlannerAgent()
+        self.registry = build_default_registry(memory)
+        self.executor = ExecutionAgent(self.registry, memory)
 
     def run_event(self, event: EventPacket) -> Dict[str, Any]:
-        """运行单事件解说闭环，返回 commentary、evidence、trace 和 verification。"""
         run_id = str(uuid.uuid4())
-        trace: List[Dict[str, Any]] = []
-        step_index = 0
-
-        def run_step(
-            agent: str,
-            tool: str,
-            input_data: Dict[str, Any],
-            func: Callable[[], Any],
-        ) -> Any:
-            nonlocal step_index
-            start = time.perf_counter()
-            status = "ok"
-            try:
-                output = func()
-                return output
-            except Exception as exc:
-                status = "error"
-                output = {"error": str(exc)}
-                raise
-            finally:
-                elapsed_ms = (time.perf_counter() - start) * 1000
-                output_data = output.to_dict() if hasattr(output, "to_dict") else output
-                if not isinstance(output_data, dict):
-                    output_data = {"value": output_data}
-                record = {
-                    "run_id": run_id,
-                    "step_index": step_index,
-                    "agent": agent,
-                    "tool": tool,
-                    "status": status,
-                    "elapsed_ms": round(elapsed_ms, 3),
-                }
-                trace.append(record)
-                self.memory.record_trace(
-                    run_id=run_id,
-                    step_index=step_index,
-                    agent=agent,
-                    tool=tool,
-                    status=status,
-                    elapsed_ms=elapsed_ms,
-                    input_data=input_data,
-                    output_data=output_data,
-                )
-                step_index += 1
-
-        plan = run_step("Planner", "tool_chain_planning", event.to_dict(), lambda: self.planner.plan(event))
-        evidence = run_step("Retriever", "rag_memory_retrieval", {"event": event.to_dict(), "plan": plan}, lambda: self.retriever.retrieve(event))
-        commentary = run_step(
-            "CommentaryWriter",
-            "commentary_generation",
-            {"event": event.to_dict(), "evidence": evidence.to_dict()},
-            lambda: self.writer.write(event, evidence),
-        )
-        verification = run_step(
-            "Verifier",
-            "factuality_check",
-            {"event": event.to_dict(), "commentary": commentary, "evidence": evidence.to_dict()},
-            lambda: self.verifier.verify(event, commentary, evidence),
+        start = time.perf_counter()
+        plan = self.planner.plan(event)
+        plan_elapsed_ms = (time.perf_counter() - start) * 1000
+        self.memory.record_trace(
+            run_id=run_id,
+            step_index=0,
+            agent="PlannerAgent",
+            tool="Tool Chain Planning",
+            status="ok",
+            elapsed_ms=plan_elapsed_ms,
+            input_data=event.to_dict(),
+            output_data=plan.to_dict(),
         )
 
+        execution = self.executor.execute(event=event, plan=plan, run_id=run_id)
+        planner_trace = {
+            "run_id": run_id,
+            "step_index": 0,
+            "agent": "PlannerAgent",
+            "tool": "Tool Chain Planning",
+            "purpose": "根据 EventPacket 规划 SoccerAgent 风格工具链。",
+            "query": event.raw_description,
+            "material": event.source_refs,
+            "answer": plan.to_dict(),
+            "status": "ok",
+            "elapsed_ms": round(plan_elapsed_ms, 3),
+        }
         return {
             "run_id": run_id,
-            "commentary": commentary,
-            "evidence": evidence.to_dict(),
-            "trace": trace,
-            "verification": verification,
+            "known_info": plan.known_info,
+            "tool_chain": plan.tool_chain,
+            "planner_prompt_style": plan.to_prompt_text(),
+            "commentary": execution["commentary"],
+            "evidence": execution["evidence"],
+            "step_results": execution["step_results"],
+            "trace": [planner_trace] + execution["trace"],
+            "evaluation": execution["evaluation"],
+            # 兼容旧 CLI / 旧训练导出字段；新文档统一称 evaluation。
+            "verification": execution["evaluation"],
         }
-
-
-def _compact_event(event: EventPacket) -> Dict[str, Any]:
-    return {
-        "minute": event.minute,
-        "event_type": event.event_type,
-        "team": event.team,
-        "players": event.players,
-        "score": event.score,
-        "raw_description": _shorten(event.raw_description, limit=180),
-        "source_refs": event.source_refs,
-    }
-
-
-def _team_from_match(match_info: Optional[Dict[str, Any]]) -> Optional[str]:
-    if not match_info:
-        return None
-    return match_info.get("home_team") or match_info.get("away_team")
-
-
-def _shorten(text: str, limit: int = 240) -> str:
-    cleaned = " ".join(text.split())
-    if len(cleaned) <= limit:
-        return cleaned
-    return cleaned[: limit - 3].rstrip() + "..."
