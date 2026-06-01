@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 from typing import Any, Dict, List
 
 from ..memory import SQLiteMemory
@@ -13,15 +14,75 @@ from .commentary_generation import build_commentary
 
 DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash"
-DEFAULT_DEEPSEEK_API_KEY ="sk-6daebbcf390f4d65992a8a72485f65df"
+_DOTENV_LOADED = False
+
+
+def _load_dotenv_if_present() -> None:
+    """读取本地 .env 文件，但不覆盖系统环境变量。"""
+    global _DOTENV_LOADED
+    if _DOTENV_LOADED:
+        return
+    _DOTENV_LOADED = True
+
+    for path in _candidate_dotenv_paths():
+        if path.is_file():
+            _load_dotenv_file(path)
+            return
+
+
+def _candidate_dotenv_paths() -> List[Path]:
+    """按常见位置查找 .env，支持从项目根目录或包目录运行命令。"""
+    package_dir = Path(__file__).resolve().parents[1]
+    repo_root = Path(__file__).resolve().parents[2]
+    cwd = Path.cwd()
+    candidates = [cwd / ".env"]
+    candidates.extend(parent / ".env" for parent in cwd.parents)
+    candidates.extend([package_dir / ".env", repo_root / ".env"])
+
+    unique: List[Path] = []
+    seen = set()
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved not in seen:
+            unique.append(resolved)
+            seen.add(resolved)
+    return unique
+
+
+def _load_dotenv_file(path: Path) -> None:
+    """解析简单 KEY=VALUE 格式的 .env 文件。"""
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = _clean_dotenv_value(value)
+        if key:
+            os.environ.setdefault(key, value)
+
+
+def _clean_dotenv_value(value: str) -> str:
+    """去掉 .env 值两侧空白和可选引号。"""
+    cleaned = value.strip()
+    if len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in {"'", '"'}:
+        return cleaned[1:-1]
+    return cleaned
+
 
 def llm_final_synthesis(query: str, material: List[str], context: Dict[str, Any], memory: SQLiteMemory) -> ToolResult:
+    _load_dotenv_if_present()
+
     candidate = str(context.get("commentary_candidate") or "")
     if not candidate:
         event = event_from_context(context)
         candidate = build_commentary(event, context.get("match_info"), context.get("timeline_events") or [], [])
 
-    api_key = os.getenv("DEEPSEEK_API_KEY",DEFAULT_DEEPSEEK_API_KEY)
+    api_key = os.getenv("DEEPSEEK_API_KEY")
     model = os.getenv("DEEPSEEK_MODEL", DEFAULT_DEEPSEEK_MODEL)
     base_url = os.getenv("DEEPSEEK_BASE_URL", DEFAULT_DEEPSEEK_BASE_URL)
     reasoning_effort = os.getenv("DEEPSEEK_REASONING_EFFORT", "low")
