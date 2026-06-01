@@ -9,4 +9,6 @@ __pycache__/
 artifacts/*.db
 artifacts/*.db-*
 artifacts/*.jsonl
-docs/*.md
+
+# 本地学习笔记/解释文档，不同步到远程仓库。
+tiny_soccer_agent/docs/
