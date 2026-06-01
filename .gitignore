@@ -9,3 +9,4 @@ __pycache__/
 artifacts/*.db
 artifacts/*.db-*
 artifacts/*.jsonl
+docs/*.md
