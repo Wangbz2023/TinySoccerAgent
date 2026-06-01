@@ -71,11 +71,4 @@ python -m tiny_soccer_agent.cli eval --db artifacts\tools_llm_smoke.db --limit 5
 python -m tiny_soccer_agent.cli export-training-data --db artifacts\tools_llm_smoke.db --output artifacts\tools_llm_training.jsonl --limit 5
 ```
 
-## 文档
 
-- [复现与包装守则](docs/AGENTS.md)
-- [实施计划](docs/IMPLEMENTATION_PLAN.md)
-- [agents.py 讲解](docs/AGENTS_PY_EXPLAINED.md)
-- [memory.py 讲解](docs/MEMORY_EXPLAINED.md)
-- [Smoke Test 说明](docs/SMOKE_TEST_EXPLAINED.md)
-- [CLI 参数解析讲解](docs/CLI_ARGUMENTS_EXPLAINED.md)
